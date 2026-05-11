@@ -10,6 +10,6 @@ The uploaded files are only a small portion of the project and were selected as 
 
 I highly recommend playing the full game to better understand the scale of the systems and features I worked on.
 
-Although Origami Simulator was developed together with my colleagues, I scripted a major part of the game and am fully capable of handling projects independently, including gameplay systems, client/server architecture, UI logic, combat systems, data handling, effects, optimization, and live content updates.
+Although Origami Simulator was developed together with my colleagues, I scripted a major part of the game and am fully capable of handling projects independently, including gameplay systems, client/server architecture, UI logic, systems, data handling, effects, optimization, and other content updates.
 
 The purpose of this repository is simply to provide code examples for portfolio and hiring purposes.
