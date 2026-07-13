@@ -1,133 +1,421 @@
+-- Discord: wiggledev | Roblox: WiggleDev
+
+local Lighting = game:GetService("Lighting")
+local Players = game:GetService("Players")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Knit = require(ReplicatedStorage.Packages.Knit)
-local Promise = require(ReplicatedStorage.Packages.Promise)
+
+local Packages = ReplicatedStorage:WaitForChild("Packages")
+
+local Knit = require(Packages:WaitForChild("Knit"))
+local Promise = require(Packages:WaitForChild("Promise"))
 local Weather = require(Knit.Shared.List.Weather)
 local TweenUtil = require(Knit.Shared.Utility.TweenUtil)
-local ServerUpdates = nil
-local hoverboardService
-local Lighting = game:GetService("Lighting")
-local weathersWithFog = {"Foggy", "Foggy And Cloudy", "Foggy And Snowy"}
 
-local WeatherService = Knit.CreateService {
-	Name = "WeatherService";
-	Client = {
-		CurrentWeather = Knit.CreateProperty(""),
-		ClaimThunder = Knit.CreateSignal()
-	};
+local FOG_WEATHERS = {
+	Foggy = true,
+	["Foggy And Cloudy"] = true,
+	["Foggy And Snowy"] = true,
 }
 
-local claimDebounces = {}
-local CURRENTWEATHER = ""
+local WeatherService = Knit.CreateService({
+	Name = "WeatherService",
+	Client = {
+		CurrentWeather = Knit.CreateProperty(""),
+		ClaimThunder = Knit.CreateSignal(),
+	},
+})
 
-function WeatherService:_simulateFog(toggled: boolean)
-	if (toggled == true) then
-		if Lighting:FindFirstChild("Atmosphere") then
-			TweenUtil.Play(Lighting:FindFirstChild("Atmosphere"), TweenInfo.new(1, Enum.EasingStyle.Sine), { Density = 0 })	
-			TweenUtil.Play(Lighting:FindFirstChild("Atmosphere"), TweenInfo.new(1, Enum.EasingStyle.Sine), { Haze = 0 })	
-			task.wait(1.5)
-			Lighting:FindFirstChild("Atmosphere").Parent = game.ReplicatedFirst	
-			task.wait(0.5)
-		end
-		local rng = math.random(500, 700)
-		TweenUtil.Play(Lighting, TweenInfo.new(1, Enum.EasingStyle.Sine), { FogEnd = rng })	
-	else
-		if game.ReplicatedFirst:FindFirstChild("Atmosphere") then
-			local Atmosphere = game.ReplicatedFirst:FindFirstChild("Atmosphere")
-			Atmosphere.Parent = game.Lighting
-			task.wait(0.1)
-			TweenUtil.Play(Atmosphere, TweenInfo.new(1, Enum.EasingStyle.Sine), { Density = 0.3 })	
-			TweenUtil.Play(Atmosphere, TweenInfo.new(1, Enum.EasingStyle.Sine), { Haze = 1 })
-		end
-		task.wait(0.5)
-		TweenUtil.Play(Lighting, TweenInfo.new(1, Enum.EasingStyle.Sine), { FogEnd = 10000 })
-	end	
+local ServerUpdates
+local HoverboardService
+
+local currentWeather = ""
+local claimedThunderPlayers = {}
+local lightningSessionId = 0
+local weatherLoopRunning = false
+
+local function getAtmosphere()
+	return Lighting:FindFirstChildOfClass("Atmosphere")
+		or ReplicatedFirst:FindFirstChildOfClass("Atmosphere")
 end
 
-function WeatherService:_simulateLightning(toggled: boolean)
-	if (toggled == true) then
-		
-	else
-		
-	end	
+local function tweenAtmosphere(atmosphere, density, haze)
+	if not atmosphere then
+		return
+	end
+
+	local tweenInfo = TweenInfo.new(
+		1,
+		Enum.EasingStyle.Sine
+	)
+
+	TweenUtil.Play(atmosphere, tweenInfo, {
+		Density = density,
+	})
+
+	TweenUtil.Play(atmosphere, tweenInfo, {
+		Haze = haze,
+	})
 end
 
-function WeatherService:_generateWeather()	
-    local weightedSum = 0
-    local NewStats = {}
+local function moveAtmosphere(parent)
+	local atmosphere = getAtmosphere()
+	if not atmosphere then
+		return nil
+	end
 
-    if ServerUpdates:ReturnWeatherInformation() ~= nil then
-        NewStats = ServerUpdates:ReturnWeatherInformation() 
-    else
-        NewStats = Weather.GetAll()
-    end
-	
-	 for key, value in pairs(NewStats) do
-        if type(value) ~= "table" or not value.CanRoll then
-            continue
-        end
-        weightedSum = weightedSum + value.Chance
-    end
-	
-	local random = Random.new()
-	local rng = random:NextNumber(0, weightedSum)
-	
-	for key, value in pairs(NewStats) do
-		if type(value) ~= "table" then
+	atmosphere.Parent = parent
+	return atmosphere
+end
+
+local function getWeatherDefinitions()
+	if ServerUpdates then
+		local success, result = pcall(function()
+			return ServerUpdates:ReturnWeatherInformation()
+		end)
+
+		if success and type(result) == "table" then
+			return result
+		end
+
+		if not success then
+			warn(
+				"[WeatherService] Failed to load server weather data:",
+				result
+			)
+		end
+	end
+
+	return Weather.GetAll()
+end
+
+local function isValidWeatherEntry(weatherData)
+	if type(weatherData) ~= "table" then
+		return false
+	end
+
+	if weatherData.CanRoll ~= true then
+		return false
+	end
+
+	if type(weatherData.Chance) ~= "number" then
+		return false
+	end
+
+	return weatherData.Chance > 0
+end
+
+local function buildWeightedWeatherList(weatherDefinitions)
+	local weightedEntries = {}
+	local totalWeight = 0
+
+	for weatherName, weatherData in pairs(weatherDefinitions) do
+		if not isValidWeatherEntry(weatherData) then
 			continue
 		end
-		local chance = value.CanRoll and value.Chance or 0
-		if rng < chance then
-			return key, value
+
+		totalWeight += weatherData.Chance
+
+		table.insert(weightedEntries, {
+			Name = weatherName,
+			Data = weatherData,
+			Weight = weatherData.Chance,
+		})
+	end
+
+	return weightedEntries, totalWeight
+end
+
+local function selectWeightedWeather()
+	local weatherDefinitions = getWeatherDefinitions()
+	local weightedEntries, totalWeight =
+		buildWeightedWeatherList(weatherDefinitions)
+
+	if totalWeight <= 0 then
+		return nil, nil
+	end
+
+	local roll = Random.new():NextNumber(0, totalWeight)
+	local cumulativeWeight = 0
+
+	for _, entry in ipairs(weightedEntries) do
+		cumulativeWeight += entry.Weight
+
+		if roll <= cumulativeWeight then
+			return entry.Name, entry.Data
 		end
-		rng = rng - chance
 	end
+
+	local fallbackEntry = weightedEntries[#weightedEntries]
+	if not fallbackEntry then
+		return nil, nil
+	end
+
+	return fallbackEntry.Name, fallbackEntry.Data
 end
 
-function WeatherService:_loadWeather()
-	local selectedWeather, weatherData = self:_generateWeather()
-	local weatherDuration = math.random(weatherData.LastTimeMin, weatherData.LastTimeMax)
-	--warn("Weather: " .. selectedWeather, "Duration: " .. weatherDuration)
-	
-	if (table.find(weathersWithFog, selectedWeather)) then
-		self:_simulateFog(true)
-	else
-		self:_simulateFog(false)
+local function getWeatherDuration(weatherData)
+	if type(weatherData) ~= "table" then
+		return 60
 	end
-	
-	if (selectedWeather) == "Stormy" then
-		self:_simulateLightning(true)
-	else
-		self:_simulateLightning(false)
-	end
-	
-	CURRENTWEATHER = selectedWeather
-	self.Client.CurrentWeather:Set(selectedWeather)
-	
-	return Promise.delay(weatherDuration) --> weatherDuration
+
+	local minimumDuration = tonumber(weatherData.LastTimeMin) or 60
+	local maximumDuration = tonumber(weatherData.LastTimeMax)
+		or minimumDuration
+
+	minimumDuration = math.max(minimumDuration, 1)
+	maximumDuration = math.max(maximumDuration, minimumDuration)
+
+	return math.random(minimumDuration, maximumDuration)
 end
 
+local function shouldUseFog(weatherName)
+	return FOG_WEATHERS[weatherName] == true
+end
 
-function WeatherService:KnitStart()
-	ServerUpdates = Knit.GetService("ServerUpdates")
-	hoverboardService = Knit.GetService("HoverboardService")
-	
-	WeatherService.Client.ClaimThunder:Connect(function(player)
-		if not claimDebounces[player] and CURRENTWEATHER == "Stormy" then
-			claimDebounces[player] = true
-			
-			hoverboardService:GrantHoverboard(player, "Stormy Hoverboard")
+local function setFogEnabled(enabled)
+	if enabled then
+		local atmosphere = getAtmosphere()
+
+		if atmosphere and atmosphere.Parent == Lighting then
+			tweenAtmosphere(atmosphere, 0, 0)
+			task.wait(1.5)
+
+			if atmosphere.Parent == Lighting then
+				atmosphere.Parent = ReplicatedFirst
+			end
+		end
+
+		task.wait(0.5)
+
+		TweenUtil.Play(
+			Lighting,
+			TweenInfo.new(
+				1,
+				Enum.EasingStyle.Sine
+			),
+			{
+				FogEnd = math.random(
+					500,
+					700
+				),
+			}
+		)
+
+		return
+	end
+
+	local atmosphere = getAtmosphere()
+
+	if atmosphere and atmosphere.Parent == ReplicatedFirst then
+		atmosphere.Parent = Lighting
+		task.wait(0.1)
+
+		tweenAtmosphere(
+			atmosphere,
+			0.3,
+			1
+		)
+	end
+
+	task.wait(0.5)
+
+	TweenUtil.Play(
+		Lighting,
+		TweenInfo.new(
+			1,
+			Enum.EasingStyle.Sine
+		),
+		{
+			FogEnd = 10000,
+		}
+	)
+end
+
+local function createLightningFlash(originalBrightness)
+	Lighting.Brightness =
+		originalBrightness * 2
+
+	task.wait(0.08)
+
+	Lighting.Brightness = originalBrightness
+end
+
+local function startLightningSimulation()
+	lightningSessionId += 1
+	local sessionId = lightningSessionId
+
+	task.spawn(function()
+		while currentWeather == "Stormy"
+			and sessionId == lightningSessionId
+		do
+			task.wait(
+				math.random(
+					3,
+					8
+				)
+			)
+
+			if currentWeather ~= "Stormy"
+				or sessionId ~= lightningSessionId
+			then
+				break
+			end
+
+			local originalBrightness = Lighting.Brightness
+			createLightningFlash(originalBrightness)
 		end
 	end)
-	
-	while (true) do
-		self:_loadWeather():await()
+end
+
+local function stopLightningSimulation()
+	lightningSessionId += 1
+end
+
+local function updateLightningState(weatherName)
+	if weatherName == "Stormy" then
+		startLightningSimulation()
+		return
 	end
+
+	stopLightningSimulation()
 end
 
-
-function WeatherService:KnitInit()
-	
+local function resetThunderClaims()
+	table.clear(claimedThunderPlayers)
 end
 
+local function applyWeatherEffects(weatherName)
+	setFogEnabled(shouldUseFog(weatherName))
+	updateLightningState(weatherName)
+end
+
+local function publishCurrentWeather(weatherName)
+	currentWeather = weatherName
+	WeatherService.Client.CurrentWeather:Set(weatherName)
+end
+
+local function loadNextWeather()
+	local selectedWeather, weatherData =
+		selectWeightedWeather()
+
+	if not selectedWeather or not weatherData then
+		warn(
+			"[WeatherService] No valid weather configuration found"
+		)
+
+		return Promise.delay(5)
+	end
+
+	local duration = getWeatherDuration(weatherData)
+
+	resetThunderClaims()
+	applyWeatherEffects(selectedWeather)
+	publishCurrentWeather(selectedWeather)
+
+	return Promise.delay(duration)
+end
+
+local function canClaimThunder(player)
+	if currentWeather ~= "Stormy" then
+		return false, "WrongWeather"
+	end
+
+	if claimedThunderPlayers[player] then
+		return false, "AlreadyClaimed"
+	end
+
+	return true
+end
+
+local function claimThunder(player)
+	local canClaim = canClaimThunder(player)
+	if not canClaim then
+		return
+	end
+
+	claimedThunderPlayers[player] = true
+
+	local success, result = pcall(function()
+		return HoverboardService:GrantHoverboard(
+			player,
+			"Stormy Hoverboard"
+		)
+	end)
+
+	if success and result ~= false then
+		return
+	end
+
+	claimedThunderPlayers[player] = nil
+
+	warn(
+		"[WeatherService] Failed to grant thunder reward to",
+		player.Name,
+		result
+	)
+end
+
+local function onPlayerRemoving(player)
+	claimedThunderPlayers[player] = nil
+end
+
+local function runWeatherLoop()
+	if weatherLoopRunning then
+		return
+	end
+
+	weatherLoopRunning = true
+
+	task.spawn(function()
+		while weatherLoopRunning do
+			local success, errorMessage =
+				loadNextWeather():await()
+
+			if success then
+				continue
+			end
+
+			warn(
+				"[WeatherService] Weather cycle failed:",
+				errorMessage
+			)
+
+			task.wait(5)
+		end
+	end)
+end
+
+function WeatherService:GetCurrentWeather()
+	return currentWeather
+end
+
+function WeatherService:ForceWeather(weatherName)
+	local weatherDefinitions = getWeatherDefinitions()
+	local weatherData = weatherDefinitions[weatherName]
+
+	if type(weatherData) ~= "table" then
+		return false, "InvalidWeather"
+	end
+
+	resetThunderClaims()
+	applyWeatherEffects(weatherName)
+	publishCurrentWeather(weatherName)
+
+	return true
+end
+
+function WeatherService:KnitStart()
+	ServerUpdates =
+		Knit.GetService("ServerUpdates")
+
+	HoverboardService =
+		Knit.GetService("HoverboardService")
+
+	self.Client.ClaimThunder:Connect(claimThunder)
+	Players.PlayerRemoving:Connect(onPlayerRemoving)
+
+	runWeatherLoop()
+end
 
 return WeatherService
