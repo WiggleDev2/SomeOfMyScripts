@@ -1,218 +1,459 @@
-local replicatedStorage = game:GetService("ReplicatedStorage") -- Shared replicated storage
-local players = game:GetService("Players") -- Players service
-local robloxBadgeService = game:GetService("BadgeService") -- Roblox badge service
-local runService = game:GetService("RunService") -- RunService for Studio checks
-local packages = replicatedStorage:WaitForChild("Packages") -- Packages folder
-local knit = require(packages:WaitForChild("Knit")) -- Knit framework
-local badgesList = require(knit.Shared.List.Badges) -- Badge config module
-local npcList = require(knit.Shared.List.NPC) -- NPC config module
-local badgesService = knit.CreateService{ -- Creates Knit service
-	Name = "BadgesService", -- Service name
-	Client = { -- Client signals
-		SpokenToNPC = knit.CreateSignal(), -- Fired when player speaks to NPC
-		ClaimReward = knit.CreateSignal() -- Fired when player claims reward
+-- Discord: wiggledev | Roblox: WiggleDev
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local BadgeService = game:GetService("BadgeService")
+local RunService = game:GetService("RunService")
+
+local Packages = ReplicatedStorage:WaitForChild("Packages")
+local Knit = require(Packages:WaitForChild("Knit"))
+local BadgesList = require(Knit.Shared.List.Badges)
+local NPCList = require(Knit.Shared.List.NPC)
+
+local BadgesService = Knit.CreateService({
+	Name = "BadgesService",
+	Client = {
+		SpokenToNPC = Knit.CreateSignal(),
+		ClaimReward = Knit.CreateSignal(),
+	},
+})
+
+local DataService
+local RewardsService
+
+-- Runtime caches avoid repeatedly scanning the full configuration during gameplay.
+-- Requirements are indexed by their actual stat name, while named badge data supports direct awards.
+local badgeRequirementsByStat = {}
+local badgeDataByName = {}
+local requiredNPCs = {}
+
+local function getReplica(player)
+	local profile = DataService:GetProfile(player)
+	if not profile then
+		return nil
+	end
+
+	return profile._Replica
+end
+
+-- Player profiles can load after the Player object appears, so initialization waits without blocking KnitStart.
+local function waitForReplica(player)
+	local replica = getReplica(player)
+
+	while not replica and player.Parent do
+		task.wait(0.5)
+		replica = getReplica(player)
+	end
+
+	return replica
+end
+
+local function contains(array, value)
+	return table.find(array, value) ~= nil
+end
+
+local function ensureArray(replica, key)
+	if replica.Data[key] then
+		return
+	end
+
+	replica:SetValue(key, {})
+end
+
+-- Older profiles may not contain fields introduced after their original save was created.
+local function ensureBadgeData(replica)
+	ensureArray(replica, "AwardedBadges")
+	ensureArray(replica, "ClaimedBadges")
+	ensureArray(replica, "SpokenNPCs")
+end
+
+local function hasAwardedBadge(replica, badgeName)
+	return contains(replica.Data.AwardedBadges, badgeName)
+end
+
+local function hasClaimedBadge(replica, badgeName)
+	return contains(replica.Data.ClaimedBadges, badgeName)
+end
+
+local function addAwardedBadge(replica, badgeName)
+	if hasAwardedBadge(replica, badgeName) then
+		return
+	end
+
+	replica:ArrayInsert("AwardedBadges", badgeName)
+end
+
+local function addClaimedBadge(replica, badgeName)
+	if hasClaimedBadge(replica, badgeName) then
+		return
+	end
+
+	replica:ArrayInsert("ClaimedBadges", badgeName)
+end
+
+-- BadgeService calls are wrapped because Roblox API requests can fail temporarily.
+local function getRobloxBadgeInfo(badgeId)
+	local success, result = pcall(BadgeService.GetBadgeInfoAsync, BadgeService, badgeId)
+	if success then
+		return result
+	end
+
+	warn(string.format("Failed to load badge info for BadgeId %s: %s", tostring(badgeId), tostring(result)))
+	return nil
+end
+
+local function userHasRobloxBadge(player, badgeId)
+	local success, result = pcall(BadgeService.UserHasBadgeAsync, BadgeService, player.UserId, badgeId)
+	if success then
+		return result
+	end
+
+	warn(string.format("Failed to check badge ownership for BadgeId %s: %s", tostring(badgeId), tostring(result)))
+	return nil
+end
+
+local function awardRobloxBadge(player, badgeId)
+	local success, result = pcall(BadgeService.AwardBadge, BadgeService, player.UserId, badgeId)
+	if success then
+		return result
+	end
+
+	warn(string.format("Failed to award BadgeId %s: %s", tostring(badgeId), tostring(result)))
+	return nil
+end
+
+local function registerBadge(badgeName, badgeData)
+	badgeDataByName[badgeName] = badgeData
+
+	if not badgeData.Category or not badgeData.AwardAt then
+		return
+	end
+
+	local badgeInfo = getRobloxBadgeInfo(badgeData.Id)
+	if not badgeInfo then
+		return
+	end
+
+	local statName = badgeData.Category
+	badgeRequirementsByStat[statName] = badgeRequirementsByStat[statName] or {}
+	table.insert(badgeRequirementsByStat[statName], {
+		AwardAt = badgeData.AwardAt,
+		BadgeId = badgeData.Id,
+		BadgeName = badgeInfo.Name,
+	})
+end
+
+local function prepareBadges()
+	table.clear(badgeRequirementsByStat)
+	table.clear(badgeDataByName)
+
+	for _, badges in pairs(BadgesList.BadgesInfo) do
+		for badgeName, badgeData in pairs(badges) do
+			registerBadge(badgeName, badgeData)
+		end
+	end
+end
+
+local function createRewardPayload(badgeName)
+	local badgeInfo = BadgesList.GetBadgeInfo(badgeName)
+	if not badgeInfo then
+		return nil
+	end
+
+	return {
+		RewardType = badgeInfo.RewardType,
+		RewardName = badgeInfo.RewardName,
+		RewardValue = badgeInfo.RewardValue,
+		PetCraft = badgeInfo.PetCraft,
 	}
-}
-local dataService -- DataService reference
-local rewardsService -- RewardsService reference
-local easyBadgeCheckup = {} -- Cached badge requirements
-local requiredNPCs = {} -- Required NPCs for NPC badge
-local function rewardBadge(player, badgeName) -- Gives badge reward
-	local replica = dataService:GetProfile(player)._Replica -- Player profile replica
-	if table.find(replica.Data.AwardedBadges, badgeName) and not table.find(replica.Data.ClaimedBadges, badgeName) then -- Checks if reward can be claimed
-		replica:ArrayInsert("ClaimedBadges", badgeName) -- Marks reward as claimed
-		rewardsService:RewardPlayer(player, { -- Gives configured reward
-			["RewardType"] = (badgesList.GetBadgeInfo(badgeName)).RewardType, -- Reward type
-			["RewardName"] = (badgesList.GetBadgeInfo(badgeName)).RewardName, -- Reward name
-			["RewardValue"] = (badgesList.GetBadgeInfo(badgeName)).RewardValue, -- Reward value
-			["PetCraft"] = (badgesList.GetBadgeInfo(badgeName)).PetCraft -- Pet craft reward
-		})
+end
+
+local function rewardBadge(player, badgeName)
+	local replica = getReplica(player)
+	if not replica then
+		return
+	end
+
+	if not hasAwardedBadge(replica, badgeName) then
+		return
+	end
+
+	if hasClaimedBadge(replica, badgeName) then
+		return
+	end
+
+	local rewardPayload = createRewardPayload(badgeName)
+	if not rewardPayload then
+		warn("No reward configuration found for badge: " .. tostring(badgeName))
+		return
+	end
+
+	-- The claim is persisted only after the reward call succeeds, preventing lost rewards on errors.
+	local success, result = pcall(RewardsService.RewardPlayer, RewardsService, player, rewardPayload)
+	if not success then
+		warn(string.format("Failed to reward badge %s: %s", tostring(badgeName), tostring(result)))
+		return
+	end
+
+	if result == false then
+		warn("RewardsService rejected reward for badge: " .. tostring(badgeName))
+		return
+	end
+
+	addClaimedBadge(replica, badgeName)
+end
+
+local function hasSpokenToAllRequiredNPCs(replica)
+	for _, npcName in ipairs(requiredNPCs) do
+		if not contains(replica.Data.SpokenNPCs, npcName) then
+			return false
+		end
+	end
+
+	return true
+end
+
+local function checkNPCBadge(player, replica)
+	if not hasSpokenToAllRequiredNPCs(replica) then
+		return
+	end
+
+	BadgesService:AwardBadge(player, "People's Person")
+end
+
+local function speakToNPC(player, npcName)
+	if not NPCList.Get(npcName) then
+		return
+	end
+
+	local replica = getReplica(player)
+	if not replica then
+		return
+	end
+
+	if contains(replica.Data.SpokenNPCs, npcName) then
+		return
+	end
+
+	replica:ArrayInsert("SpokenNPCs", npcName)
+	checkNPCBadge(player, replica)
+end
+
+local function syncOwnedBadge(replica, badgeName)
+	addAwardedBadge(replica, badgeName)
+end
+
+local function restoreMissingRobloxBadge(player, replica, badgeId, badgeName)
+	local result = awardRobloxBadge(player, badgeId)
+	if not result then
+		return
+	end
+
+	addAwardedBadge(replica, badgeName)
+end
+
+-- Reconciliation keeps Roblox badge ownership and persistent profile data consistent in both directions.
+local function reconcileBadge(player, replica, badgeData)
+	local badgeInfo = getRobloxBadgeInfo(badgeData.Id)
+	if not badgeInfo then
+		return
+	end
+
+	local ownsRobloxBadge = userHasRobloxBadge(player, badgeData.Id)
+	if ownsRobloxBadge == nil then
+		return
+	end
+
+	local ownsLocalBadge = hasAwardedBadge(replica, badgeInfo.Name)
+
+	if ownsRobloxBadge then
+		syncOwnedBadge(replica, badgeInfo.Name)
+		return
+	end
+
+	if not ownsLocalBadge then
+		return
+	end
+
+	restoreMissingRobloxBadge(player, replica, badgeData.Id, badgeInfo.Name)
+end
+
+local function reconcileAllBadges(player, replica)
+	for _, badges in pairs(BadgesList.BadgesInfo) do
+		for badgeName, badgeData in pairs(badges) do
+			reconcileBadge(player, replica, badgeData)
+		end
 	end
 end
-local function prepareBadges() -- Prepares badge cache
-	for categoryName, badges in pairs(badgesList.BadgesInfo) do -- Loops badge categories
-		if not easyBadgeCheckup[categoryName] then -- Checks if category cache exists
-			easyBadgeCheckup[categoryName] = {} -- Creates category cache
+
+local function reconcileData(player)
+	task.spawn(function()
+		local replica = waitForReplica(player)
+		if not replica then
+			return
 		end
-		for badgeName, badgeData in pairs(badges) do -- Loops badges in category
-			if badgeData["Category"] and badgeData["AwardAt"] then -- Checks if badge has requirements
-				local success, result = pcall(function() -- Safely runs Roblox API call
-					return robloxBadgeService:GetBadgeInfoAsync(badgeData.Id) -- Gets badge info
-				end)
-				if success and result then -- Checks if badge info loaded
-					table.insert(easyBadgeCheckup[categoryName], { -- Saves badge requirement to cache
-						BadgeAwardAt = badgeData["AwardAt"], -- Required amount
-						BadgeName = result["Name"] -- Badge name
-					})
-				else
-					warn("Failed to get badge info for BadgeId: " .. badgeData.Id)
-				end
-			end
-		end
-	end
-end
-local function checkAndPrintMissingNPCs(player) -- Checks missing NPCs
-	local profile = dataService:GetProfile(player)._Replica -- Player profile
-	local missingNPCs = {} -- Missing NPC list
-	for _, requiredNPC in pairs(requiredNPCs) do -- Loops required NPCs
-		if not table.find(profile.Data.SpokenNPCs, requiredNPC) then -- Checks if NPC was not spoken to
-			table.insert(missingNPCs, requiredNPC) -- Adds NPC to missing list
-		end
-	end
-	if #missingNPCs == 0 then -- Checks if no NPCs are missing
-		badgesService:AwardBadge(player, "People's Person") -- Awards NPC badge
-	end
-end
-local function reconcileData(player) -- Syncs badge data
-	task.spawn(function() -- Runs in separate task
-		repeat
-			task.wait(0.5) -- Waits before retrying
-		until dataService:GetProfile(player) -- Waits for player profile
-		local profile = dataService:GetProfile(player)._Replica -- Player profile
-		if not profile.Data.AwardedBadges then -- Checks AwardedBadges data
-			profile:SetValue("AwardedBadges", {}) -- Creates AwardedBadges data
-		end
-		if not profile.Data.ClaimedBadges then -- Checks ClaimedBadges data
-			profile:SetValue("ClaimedBadges", {}) -- Creates ClaimedBadges data
-		end
-		if not profile.Data.SpokenNPCs then -- Checks SpokenNPCs data
-			profile:SetValue("SpokenNPCs", {}) -- Creates SpokenNPCs data
-		end
-		for categoryName, badges in pairs(badgesList.BadgesInfo) do -- Loops badge categories
-			for badgeName, badgeData in pairs(badges) do -- Loops badges
-				local success, hasBadge = pcall(function() -- Safely checks badge ownership
-					return robloxBadgeService:UserHasBadgeAsync(player.UserId, badgeData.Id) -- Checks Roblox badge ownership
-				end)
-				if success then -- Checks if ownership check worked
-					local success2, result = pcall(function() -- Safely gets badge info
-						return robloxBadgeService:GetBadgeInfoAsync(badgeData.Id) -- Gets Roblox badge info
-					end)
-					if success2 and result then -- Checks if badge info loaded
-						if hasBadge then -- Checks if player owns badge
-							if not table.find(profile.Data.AwardedBadges, result.Name) then -- Checks if badge missing locally
-								profile:ArrayInsert("AwardedBadges", result.Name) -- Adds badge locally
-							end
-						else
-							if table.find(profile.Data.AwardedBadges, result.Name) then -- Checks if local data says player owns badge
-								robloxBadgeService:AwardBadge(player.UserId, badgeData.Id) -- Re-awards badge on Roblox
-							end
-						end
-					end
-				end
-			end
-		end
-		warn(profile.Data.AwardedBadges, profile.Data.ClaimedBadges)
+
+		ensureBadgeData(replica)
+		reconcileAllBadges(player, replica)
+		checkNPCBadge(player, replica)
 	end)
 end
-local function getBadgeIdByRequirement(requirement, stat) -- Finds badge ID by requirement
-	for _, badges in pairs(badgesList.BadgesInfo) do -- Loops badge categories
-		for badgeName, data in pairs(badges) do -- Loops badges
-			if data.Category == stat and data.AwardAt == requirement then -- Checks matching stat and requirement
-				return data.Id -- Returns badge ID
-			end
-		end
-	end
-	return nil -- Returns nothing if badge was not found
+
+local function awardBadgeLocally(replica, badgeName)
+	addAwardedBadge(replica, badgeName)
 end
-local function speakToNpc(player, npcName) -- Handles NPC speaking
-	if npcList.Get(npcName) then -- Checks if NPC exists
-		local profile = dataService:GetProfile(player)._Replica -- Player profile
-		if not table.find(profile.Data.SpokenNPCs, npcName) then -- Checks if NPC was not already spoken to
-			profile:ArrayInsert("SpokenNPCs", npcName) -- Saves NPC as spoken to
-			local allNPCsSpokenTo = true -- Tracks if all NPCs were spoken to
-			local missingNPCs = {} -- Missing NPC list
-			for _, requiredNPC in pairs(requiredNPCs) do -- Loops required NPCs
-				if not table.find(profile.Data.SpokenNPCs, requiredNPC) then -- Checks if required NPC missing
-					allNPCsSpokenTo = false -- Marks badge requirement incomplete
-					table.insert(missingNPCs, requiredNPC) -- Adds missing NPC
-					break
-				end
-			end
-			if allNPCsSpokenTo then -- Checks if all NPCs were spoken to
-				badgesService:AwardBadge(player, "People's Person") -- Awards NPC badge
-			end
-		end
+
+local function awardBadgeNormally(player, replica, badgeId, badgeName)
+	local result = awardRobloxBadge(player, badgeId)
+	if not result then
+		return false
 	end
+
+	addAwardedBadge(replica, badgeName)
+	return true
 end
-function badgesService:BadgeCheckup(player, changedStat) -- Checks stat badges
-	local profile = dataService:GetProfile(player)._Replica -- Player profile
-	local stat = profile.Data[changedStat] -- Current stat value
-	if easyBadgeCheckup[changedStat] then -- Checks if stat has badge cache
-		for _, requirement in pairs(easyBadgeCheckup[changedStat]) do -- Loops requirements
-			if stat >= requirement.BadgeAwardAt and not table.find(profile.Data.AwardedBadges, requirement.BadgeName) then -- Checks if badge should be awarded
-				local badgeId = getBadgeIdByRequirement(requirement.BadgeAwardAt, changedStat) -- Gets badge ID
-				if badgeId then -- Checks if badge ID exists
-					if runService:IsStudio() then -- Checks if running in Studio
-						profile:ArrayInsert("AwardedBadges", requirement.BadgeName) -- Adds badge locally in Studio
-					else
-						local awardSuccess, result = pcall(function() -- Safely awards badge
-							return robloxBadgeService:AwardBadge(player.UserId, badgeId) -- Awards Roblox badge
-						end)
-						if awardSuccess and result then -- Checks if awarding succeeded
-							profile:ArrayInsert("AwardedBadges", result["Name"]) -- Saves awarded badge locally
-						else
-							warn("Failed to award badge for BadgeId: " .. badgeId)
-						end
-					end
-				else
-					warn("Badge ID not found for requirement: " .. requirement.BadgeAwardAt)
-				end
-			end
+
+-- Studio cannot reliably grant live Roblox badges, so tests record them only in profile data.
+local function awardConfiguredBadge(player, replica, badgeId, badgeName)
+	if RunService:IsStudio() then
+		awardBadgeLocally(replica, badgeName)
+		return true
+	end
+
+	return awardBadgeNormally(player, replica, badgeId, badgeName)
+end
+
+local function shouldAwardRequirement(replica, statValue, requirement)
+	if statValue < requirement.AwardAt then
+		return false
+	end
+
+	return not hasAwardedBadge(replica, requirement.BadgeName)
+end
+
+function BadgesService:BadgeCheckup(player, changedStat)
+	local replica = getReplica(player)
+	if not replica then
+		return
+	end
+
+	local requirements = badgeRequirementsByStat[changedStat]
+	if not requirements then
+		return
+	end
+
+	local statValue = replica.Data[changedStat]
+	if type(statValue) ~= "number" then
+		return
+	end
+
+	for _, requirement in ipairs(requirements) do
+		if shouldAwardRequirement(replica, statValue, requirement) then
+			awardConfiguredBadge(player, replica, requirement.BadgeId, requirement.BadgeName)
 		end
 	end
 end
-function badgesService:AwardBadge(player, badgeName) -- Awards specific badge by name
-	local profile = dataService:GetProfile(player)._Replica -- Player profile
-	if not table.find(profile.Data.AwardedBadges, badgeName) then -- Checks if badge not already awarded
-		local data = nil -- Badge data holder
-		for _, badges in pairs(badgesList.BadgesInfo) do -- Loops badge categories
-			data = badges[badgeName] -- Tries to find badge by name
-			if data then
-				break
-			end
-		end
-		if data and data.Id then -- Checks if badge data exists
-			local badgeId = data.Id -- Badge ID
-			if runService:IsStudio() then -- Checks if running in Studio
-				profile:ArrayInsert("AwardedBadges", badgeName) -- Adds badge locally in Studio
-			else
-				local awardSuccess, result = pcall(function() -- Safely awards badge
-					return robloxBadgeService:AwardBadge(player.UserId, badgeId) -- Awards Roblox badge
-				end)
-				if awardSuccess then -- Checks if award succeeded
-					profile:ArrayInsert("AwardedBadges", badgeName) -- Saves badge locally
-				end
+
+function BadgesService:AwardBadge(player, badgeName)
+	local replica = getReplica(player)
+	if not replica then
+		return false
+	end
+
+	if hasAwardedBadge(replica, badgeName) then
+		return true
+	end
+
+	local badgeData = badgeDataByName[badgeName]
+	if not badgeData or not badgeData.Id then
+		warn("Badge configuration not found for: " .. tostring(badgeName))
+		return false
+	end
+
+	return awardConfiguredBadge(player, replica, badgeData.Id, badgeName)
+end
+
+local function findNPCFolder(container, worldName)
+	local world = container:FindFirstChild(worldName)
+	if not world then
+		return nil
+	end
+
+	local interactables = world:FindFirstChild("Interactables")
+	if not interactables then
+		return nil
+	end
+
+	return interactables:FindFirstChild("NPC")
+end
+
+local function npcExists(container, worldName, npcName)
+	if not container then
+		return false
+	end
+
+	local npcFolder = findNPCFolder(container, worldName)
+	if not npcFolder then
+		return false
+	end
+
+	return npcFolder:FindFirstChild(npcName) ~= nil
+end
+
+local function isRequiredNPC(worldName, npcName, npcInfo)
+	if not npcInfo.CountForBadge or not npcInfo.Dialogue then
+		return false
+	end
+
+	local workspaceMaps = workspace:FindFirstChild("Maps")
+	local replicatedWorlds = ReplicatedStorage:FindFirstChild("Worlds")
+
+	return npcExists(workspaceMaps, worldName, npcName)
+		or npcExists(replicatedWorlds, worldName, npcName)
+end
+
+-- Only NPCs present in an active or replicated world count toward the conversation badge.
+local function prepareRequiredNPCs()
+	table.clear(requiredNPCs)
+
+	for worldName, worldData in pairs(NPCList.List) do
+		for npcName, npcInfo in pairs(worldData) do
+			if isRequiredNPC(worldName, npcName, npcInfo) then
+				table.insert(requiredNPCs, npcName)
 			end
 		end
 	end
 end
-function badgesService:KnitStart() -- Starts service
-	task.wait(0.5) -- Short startup delay
-	dataService = knit.GetService("DataService") -- Gets DataService
-	rewardsService = knit.GetService("RewardsService") -- Gets RewardsService
-	prepareBadges() -- Builds badge cache
-	badgesService.Client.SpokenToNPC:Connect(speakToNpc) -- Connects NPC signal
-	self.Client.ClaimReward:Connect(function(player: Player, badgeName) -- Connects reward claim signal
-		rewardBadge(player, badgeName) -- Rewards claimed badge
+
+local function initializePlayer(player)
+	reconcileData(player)
+
+	task.spawn(function()
+		local replica = waitForReplica(player)
+		if not replica then
+			return
+		end
+
+		BadgesService:BadgeCheckup(player, "Hatched")
+		BadgesService:BadgeCheckup(player, "Origami")
 	end)
-	for worldName, worldData in pairs(npcList.List) do -- Loops worlds
-		for npcName, npcInfo in pairs(worldData) do -- Loops NPCs
-			if npcInfo.CountForBadge and npcInfo.Dialogue then -- Checks if NPC counts for badge
-				local workspaceMap = game.Workspace:FindFirstChild("Maps") -- Finds workspace maps folder
-				local replicatedMap = game.ReplicatedStorage:FindFirstChild("Worlds") -- Finds replicated worlds folder
-				local npcExistsInWorkspace = workspaceMap and workspaceMap:FindFirstChild(worldName) and workspaceMap[worldName]:FindFirstChild("Interactables") and workspaceMap[worldName].Interactables:FindFirstChild("NPC") and workspaceMap[worldName].Interactables.NPC:FindFirstChild(npcName) -- Checks NPC in workspace
-				local npcExistsInReplicated = replicatedMap and replicatedMap:FindFirstChild(worldName) and replicatedMap[worldName]:FindFirstChild("Interactables") and replicatedMap[worldName].Interactables:FindFirstChild("NPC") and replicatedMap[worldName].Interactables.NPC:FindFirstChild(npcName) -- Checks NPC in replicated storage
-				if npcExistsInWorkspace or npcExistsInReplicated then -- Checks if NPC exists anywhere
-					table.insert(requiredNPCs, npcName) -- Adds NPC to required list
-				end
-			end
-		end
-	end
-	for _, player in pairs(players:GetPlayers()) do -- Loops current players
-		reconcileData(player) -- Syncs player badge data
-		badgesService:BadgeCheckup(player, "Hatched") -- Checks Hatched badges
-		badgesService:BadgeCheckup(player, "Origami") -- Checks Origami badges
-	end
-	players.PlayerAdded:Connect(reconcileData) -- Syncs new players
 end
-return badgesService -- Returns Knit service
+
+function BadgesService:KnitStart()
+	DataService = Knit.GetService("DataService")
+	RewardsService = Knit.GetService("RewardsService")
+
+	prepareBadges()
+	prepareRequiredNPCs()
+
+	self.Client.SpokenToNPC:Connect(speakToNPC)
+	self.Client.ClaimReward:Connect(rewardBadge)
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		initializePlayer(player)
+	end
+
+	Players.PlayerAdded:Connect(initializePlayer)
+end
+
+return BadgesService
