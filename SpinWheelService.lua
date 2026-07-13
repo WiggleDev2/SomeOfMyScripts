@@ -14,8 +14,6 @@ local SpinWheelData = require(Lists:WaitForChild("SpinWheel"))
 local PROFILE_WAIT_INTERVAL = 0.1
 local ROBUX_SPIN_DELAY = 0.1
 local LUCK_THRESHOLD = 8
-local LUCK_ABILITY_NAME = "BetterLuckRewards"
-local SPIN_CHALLENGE_NAME = "Spin The Wheel"
 
 local SpinWheelService = Knit.CreateService({
 	Name = "SpinWheelService",
@@ -166,7 +164,7 @@ local function getLuckBoost(player)
 	local success, result = pcall(function()
 		return PetAbilityService:GetBoostByAbility(
 			player,
-			LUCK_ABILITY_NAME
+			"BetterLuckRewards"
 		)
 	end)
 
@@ -304,7 +302,7 @@ local function progressSpinChallenge(player, spinName, amount)
 	local success, errorMessage = pcall(function()
 		ChallengesService:ProgressChallenge(
 			player,
-			SPIN_CHALLENGE_NAME,
+			"Spin The Wheel",
 			spinName,
 			amount
 		)
