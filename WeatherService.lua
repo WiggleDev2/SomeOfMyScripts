@@ -31,9 +31,14 @@ local HoverboardService
 
 local currentWeather = ""
 local claimedThunderPlayers = {}
+
+-- Each lightning simulation receives its own session ID so an old loop
+-- cannot continue producing flashes after the weather changes.
 local lightningSessionId = 0
 local weatherLoopRunning = false
 
+-- The atmosphere is moved between Lighting and ReplicatedFirst depending
+-- on whether Roblox fog or Atmosphere should control visibility.
 local function getAtmosphere()
 	return Lighting:FindFirstChildOfClass("Atmosphere")
 		or ReplicatedFirst:FindFirstChildOfClass("Atmosphere")
@@ -68,6 +73,8 @@ local function moveAtmosphere(parent)
 	return atmosphere
 end
 
+-- Live server definitions take priority, with the shared weather list
+-- acting as a fallback if updated data is unavailable.
 local function getWeatherDefinitions()
 	if ServerUpdates then
 		local success, result = pcall(function()
@@ -126,6 +133,8 @@ local function buildWeightedWeatherList(weatherDefinitions)
 	return weightedEntries, totalWeight
 end
 
+-- Weather is selected using a cumulative weighted roll rather than
+-- treating each configured weather type equally.
 local function selectWeightedWeather()
 	local weatherDefinitions = getWeatherDefinitions()
 	local weightedEntries, totalWeight =
@@ -146,6 +155,7 @@ local function selectWeightedWeather()
 		end
 	end
 
+	-- The final entry covers rare floating-point edge cases.
 	local fallbackEntry = weightedEntries[#weightedEntries]
 	if not fallbackEntry then
 		return nil, nil
@@ -154,6 +164,7 @@ local function selectWeightedWeather()
 	return fallbackEntry.Name, fallbackEntry.Data
 end
 
+-- Invalid duration ranges are repaired before selecting a random length.
 local function getWeatherDuration(weatherData)
 	if type(weatherData) ~= "table" then
 		return 60
@@ -173,6 +184,8 @@ local function shouldUseFog(weatherName)
 	return FOG_WEATHERS[weatherName] == true
 end
 
+-- Fog weather temporarily removes Atmosphere so it does not compete with
+-- Lighting.FogEnd. Normal weather restores and fades the atmosphere back in.
 local function setFogEnabled(enabled)
 	if enabled then
 		local atmosphere = getAtmosphere()
@@ -241,6 +254,8 @@ local function createLightningFlash(originalBrightness)
 	Lighting.Brightness = originalBrightness
 end
 
+-- The captured session ID invalidates this loop as soon as another
+-- lightning session starts or the current one is stopped.
 local function startLightningSimulation()
 	lightningSessionId += 1
 	local sessionId = lightningSessionId
@@ -281,6 +296,7 @@ local function updateLightningState(weatherName)
 	stopLightningSimulation()
 end
 
+-- Thunder rewards may be claimed once per player during each storm.
 local function resetThunderClaims()
 	table.clear(claimedThunderPlayers)
 end
@@ -290,11 +306,14 @@ local function applyWeatherEffects(weatherName)
 	updateLightningState(weatherName)
 end
 
+-- The current weather is stored server-side and replicated to clients.
 local function publishCurrentWeather(weatherName)
 	currentWeather = weatherName
 	WeatherService.Client.CurrentWeather:Set(weatherName)
 end
 
+-- Returns a Promise so the main weather loop can wait for the selected
+-- weather duration before beginning the next cycle.
 local function loadNextWeather()
 	local selectedWeather, weatherData =
 		selectWeightedWeather()
@@ -328,6 +347,8 @@ local function canClaimThunder(player)
 	return true
 end
 
+-- The player is marked before granting the reward to block duplicate
+-- requests. The claim is restored if the grant fails.
 local function claimThunder(player)
 	local canClaim = canClaimThunder(player)
 	if not canClaim then
@@ -360,6 +381,8 @@ local function onPlayerRemoving(player)
 	claimedThunderPlayers[player] = nil
 end
 
+-- Only one weather loop may run at a time. Failed cycles wait briefly
+-- before retrying so repeated errors cannot create a tight loop.
 local function runWeatherLoop()
 	if weatherLoopRunning then
 		return
@@ -390,6 +413,8 @@ function WeatherService:GetCurrentWeather()
 	return currentWeather
 end
 
+-- Forced weather uses the same effect and replication path as naturally
+-- selected weather, but does not wait for or replace the active loop.
 function WeatherService:ForceWeather(weatherName)
 	local weatherDefinitions = getWeatherDefinitions()
 	local weatherData = weatherDefinitions[weatherName]
