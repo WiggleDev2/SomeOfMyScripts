@@ -27,8 +27,8 @@ local StockPetsController = Knit.CreateController({
 local InteractableController
 local StockPetsService
 
--- Stores all runtime state per stock ID so one interaction cannot
--- overwrite animation or input state belonging to another stock.
+-- Runtime state is stored per stock so separate stands cannot overwrite
+-- each other's interaction, animation or input state.
 local stockStates = {}
 local petAnimationStates = {}
 local renderConnection
@@ -70,6 +70,8 @@ local function getStockModel(stockId)
 	return StockPetsFolder:FindFirstChild(stockId)
 end
 
+-- These helpers resolve the expected stock model hierarchy while safely
+-- returning nil when a required object is missing.
 local function getStandContainer(stockModel)
 	if not stockModel then
 		return nil
@@ -147,8 +149,8 @@ local function getInteractionSize(sizeMultiplier)
 	)
 end
 
--- Updates both the interaction container and text so the prompt
--- never remains visible while its BillboardGui is disabled.
+-- The prompt container and text are animated together so no visible
+-- elements remain after the BillboardGui is disabled.
 local function tweenInteraction(enabled, interaction, sizeMultiplier)
 	if not interaction then
 		return
@@ -197,6 +199,7 @@ local function tweenInteraction(enabled, interaction, sizeMultiplier)
 		return
 	end
 
+	-- Disabling is delayed until the closing tween has finished.
 	task.delay(0.2, function()
 		if interaction.Parent then
 			interaction.Enabled = false
@@ -219,6 +222,7 @@ local function setExpirationVisible(stockModel, visible)
 	)
 end
 
+-- Product data is validated locally before opening the Roblox purchase prompt.
 local function promptPurchase(stockId)
 	local product = getStockConfiguration(stockId)
 	if not product then
@@ -280,6 +284,8 @@ local function isStockInteractable(state)
 	)
 end
 
+-- State changes are cached so prompts are only tweened when their
+-- visibility or pressed size actually changes.
 local function updateInteractionState(state)
 	if not state or not state.Interaction then
 		return
@@ -306,8 +312,8 @@ local function updateInteractionState(state)
 	)
 end
 
--- A single RenderStepped connection updates every active prompt.
--- The original version created one permanent render connection per stock.
+-- One RenderStepped connection updates every active prompt instead of
+-- creating a permanent render connection for each stock.
 local function updateAllInteractions()
 	for _, state in pairs(stockStates) do
 		updateInteractionState(state)
@@ -328,6 +334,8 @@ local function stopPetAnimation(stockId)
 	petAnimationStates[stockId] = nil
 end
 
+-- The original CFrame is stored once so the floating animation remains
+-- relative to the pet's placed position.
 local function registerPetAnimation(stockId, pet)
 	if not pet or not pet:IsA("Model") then
 		return
@@ -344,8 +352,8 @@ local function registerPetAnimation(stockId, pet)
 	}
 end
 
--- Pet animations also share one RenderStepped connection through
--- the same controller update loop instead of one connection per pet.
+-- All displayed pets share one render update instead of one connection
+-- per model.
 local function updatePetAnimations()
 	local timeStep = os.clock() / 1.5
 
@@ -387,6 +395,7 @@ local function startPetAnimationUpdater()
 	)
 end
 
+-- The interaction is animated out before being destroyed.
 local function destroyInteraction(stockId)
 	local state = getStockState(stockId)
 	if not state then
@@ -420,6 +429,7 @@ local function removeInteraction(stockId)
 	setExpirationVisible(state.StockModel, false)
 	destroyInteraction(stockId)
 
+	-- State cleanup waits for the expiration and interaction tweens to finish.
 	task.delay(0.5, function()
 		if stockStates[stockId] == state then
 			stockStates[stockId] = nil
@@ -427,6 +437,7 @@ local function removeInteraction(stockId)
 	end)
 end
 
+-- Validates the complete model hierarchy before exposing a stock for purchase.
 local function prepareStock(stockId)
 	local stockConfiguration = getStockConfiguration(stockId)
 	if not stockConfiguration then
@@ -483,6 +494,7 @@ local function prepareStock(stockId)
 	updateInteractionState(stockStates[stockId])
 end
 
+-- Nearby prompts shrink while the interaction key is held.
 local function setPressedStateForNearbyStocks(isPressed)
 	for _, state in pairs(stockStates) do
 		if isStockInteractable(state) then
@@ -492,6 +504,7 @@ local function setPressedStateForNearbyStocks(isPressed)
 	end
 end
 
+-- When several stock stands are in range, only the closest one is purchased.
 local function purchaseNearestStock()
 	local nearestStockId
 	local nearestDistance = math.huge
@@ -548,6 +561,7 @@ local function onInputEnded(input, gameProcessed)
 	setPressedStateForNearbyStocks(false)
 end
 
+-- Input connections are created once even if controller setup is repeated.
 local function connectInput()
 	if not inputBeganConnection then
 		inputBeganConnection =
@@ -560,6 +574,7 @@ local function connectInput()
 	end
 end
 
+-- Each configured pet model is registered for the shared floating animation.
 local function setupPetAnimations()
 	for stockId in pairs(StockPetList) do
 		local stockModel = getStockModel(stockId)
@@ -579,6 +594,8 @@ local function setupPetAnimations()
 	startPetAnimationUpdater()
 end
 
+-- Active stocks are requested from the server so players joining later
+-- receive the current stock state.
 local function loadActiveStocks()
 	StockPetsService:GetActiveStocks():andThen(function(activeStocks)
 		if type(activeStocks) ~= "table" then
