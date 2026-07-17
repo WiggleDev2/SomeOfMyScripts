@@ -24,12 +24,10 @@ local ChallengesService
 local RewardsService
 local PetAbilityService
 
--- Tracks spins currently being processed so a player cannot trigger the same
--- reward repeatedly before the cooldown is saved by the server.
+-- Prevents duplicate spin requests from being processed before the first one finishes.
 local activeSpins = {}
 
--- Returns the loaded profile container used by this game's data system.
--- Keeping profile access in one function avoids repeated unsafe indexing.
+-- Returns the player's loaded profile data, or nil if it is not ready yet.
 local function getProfileData(player)
 	local profile = DataService:GetProfile(player)
 	if not profile then
@@ -39,8 +37,7 @@ local function getProfileData(player)
 	return profile._Data
 end
 
--- Waits for DataService to finish loading a player's profile. The loop stops
--- when the player leaves so an abandoned task cannot continue indefinitely.
+-- Waits for the player's profile to load, but stops if they leave the server.
 local function waitForProfileData(player)
 	while player.Parent == Players do
 		local profileData = getProfileData(player)
@@ -54,8 +51,7 @@ local function waitForProfileData(player)
 	return nil
 end
 
--- Creates missing cooldown entries without overwriting existing timestamps.
--- Each configured group reward receives its own independent cooldown value.
+-- Ensures every configured group reward has its own saved cooldown value.
 local function initializeRewardCooldowns(profileData)
 	profileData.GroupRewardsData = profileData.GroupRewardsData or {}
 
@@ -85,6 +81,7 @@ local function getRewardConfiguration(rewardName)
 	return GroupRewardsList[rewardName]
 end
 
+-- GroupId 1 is treated as unrestricted; other groups are checked safely through pcall.
 local function isGroupRequirementMet(player, groupId)
 	if groupId == 1 then
 		return true
@@ -106,8 +103,7 @@ local function isGroupRequirementMet(player, groupId)
 	return isInGroup
 end
 
--- Validates all server-authoritative requirements before a spin is accepted.
--- The client only supplies a reward name and cannot decide eligibility itself.
+-- All eligibility checks happen on the server so the client cannot bypass them.
 local function validateSpin(player, rewardName)
 	local rewardData = getRewardConfiguration(rewardName)
 	if not rewardData then
@@ -133,6 +129,7 @@ local function validateSpin(player, rewardName)
 	return true, rewardData, profileData
 end
 
+-- Reads the player's luck ability, falling back to zero if the service fails.
 local function getLuckBoost(player)
 	local success, boost = pcall(function()
 		return PetAbilityService:GetBoostByAbility(player, "BetterLuckRewards")
@@ -145,8 +142,7 @@ local function getLuckBoost(player)
 	return math.max(boost, 0)
 end
 
--- Builds adjusted weights once per spin. BetterLuckRewards only affects rewards
--- whose base chance is 8 or lower, preserving the behavior of the old service.
+-- Builds weighted reward chances, applying luck only to rare rewards.
 local function buildRewardWeights(player, rewards)
 	local luckBoost = getLuckBoost(player)
 	local weightedRewards = {}
@@ -172,8 +168,7 @@ local function buildRewardWeights(player, rewards)
 	return weightedRewards, totalWeight
 end
 
--- Uses a cumulative weighted roll, which is easier to verify than repeatedly
--- subtracting from the total weight while iterating through the reward table.
+-- Selects one reward through a cumulative weighted roll.
 local function selectRandomReward(player, rewards)
 	local weightedRewards, totalWeight = buildRewardWeights(player, rewards)
 	if totalWeight <= 0 then
@@ -194,6 +189,7 @@ local function selectRandomReward(player, rewards)
 	return weightedRewards[#weightedRewards].Index
 end
 
+-- Rewards are wrapped in pcall because external service calls may fail.
 local function grantReward(player, rewardData)
 	local success, result = pcall(function()
 		return RewardsService:RewardPlayer(player, rewardData)
@@ -208,8 +204,6 @@ local function grantReward(player, rewardData)
 		return false
 	end
 
-	-- Some reward services do not return a value on success. Only an explicit
-	-- false is treated as failure so both API styles remain compatible.
 	if result == false then
 		warn(string.format(
 			"[GroupRewardsService] RewardsService rejected reward for %s",
@@ -223,7 +217,6 @@ end
 
 local function progressChallenge(player, rewardName)
 	local success, err = pcall(function()
-		-- Preserve the existing ChallengesService call signature used by the game.
 		ChallengesService:ProgressChallenge("GroupRewards", rewardName, 1)
 	end)
 
@@ -240,6 +233,8 @@ local function getSpinKey(player, rewardName)
 	return string.format("%d:%s", player.UserId, rewardName)
 end
 
+-- Processes a validated spin, reserves its cooldown, grants the reward,
+-- and restores the previous cooldown if reward delivery fails.
 local function processSpin(player, rewardName)
 	local isValid, rewardDataOrReason, profileData = validateSpin(player, rewardName)
 	if not isValid then
@@ -266,8 +261,6 @@ local function processSpin(player, rewardName)
 	local previousCooldown = profileData.GroupRewardsData[rewardName] or 0
 	local resetDuration = math.max(tonumber(rewardData.ResetsEvery) or 0, 0)
 
-	-- Reserve the cooldown before granting the reward. This closes the small
-	-- window in which multiple remote requests could otherwise all pass validation.
 	profileData.GroupRewardsData[rewardName] = os.time() + resetDuration
 
 	local rewardGranted = grantReward(player, selectedReward)
@@ -282,6 +275,7 @@ local function processSpin(player, rewardName)
 	return true
 end
 
+-- Locks each player's reward spin until processing finishes.
 local function spin(player, rewardName)
 	local rewardData = getRewardConfiguration(rewardName)
 	if not rewardData then
@@ -310,6 +304,7 @@ local function spin(player, rewardName)
 	end
 end
 
+-- Removes any remaining spin locks when a player leaves.
 local function clearPlayerState(player)
 	local keyPrefix = tostring(player.UserId) .. ":"
 
