@@ -40,8 +40,8 @@ local ObstructionController = Knit.CreateController({
 local ObstructionService
 local EggHatchController
 
--- A single Heartbeat connection updates every DistanceFade object.
--- This avoids creating one permanent connection for each obstruction part.
+-- A single Heartbeat connection updates every DistanceFade object instead
+-- of creating a separate permanent connection for each obstruction part.
 local activeDistanceFades = {}
 local registeredParts = {}
 local heartbeatConnection
@@ -67,6 +67,8 @@ local function canApplyRejectionEffect()
 	return not EggHatchController:IsHatching()
 end
 
+-- Only valid obstruction parts are registered, preventing duplicate or
+-- unnecessary DistanceFade objects from being created.
 local function createDistanceFade(part)
 	if registeredParts[part] then
 		return
@@ -90,6 +92,8 @@ local function createDistanceFade(part)
 	table.insert(activeDistanceFades, distanceFade)
 end
 
+-- Existing descendants are registered immediately, while DescendantAdded
+-- ensures obstruction parts created later receive the same behaviour.
 local function registerObstructionFolder(obstructionFolder)
 	for _, descendant in ipairs(obstructionFolder:GetDescendants()) do
 		createDistanceFade(descendant)
@@ -107,6 +111,8 @@ local function registerMap(map)
 	registerObstructionFolder(obstructionFolder)
 end
 
+-- The same registration logic supports both currently loaded maps and
+-- maps that are added to the container later.
 local function registerMapsFrom(container)
 	if not container then
 		return
@@ -127,6 +133,8 @@ local function registerMapsFrom(container)
 	end)
 end
 
+-- Fade updates are protected so one broken obstruction cannot interrupt
+-- updates for every other registered DistanceFade object.
 local function stepDistanceFades()
 	for index = #activeDistanceFades, 1, -1 do
 		local distanceFade = activeDistanceFades[index]
@@ -144,6 +152,8 @@ local function stepDistanceFades()
 			errorMessage
 		)
 
+		-- Remove failed objects so they do not continue throwing errors
+		-- on every subsequent Heartbeat.
 		table.remove(activeDistanceFades, index)
 	end
 end
@@ -157,7 +167,7 @@ local function startDistanceFadeUpdater()
 end
 
 -- The shake is applied to the current camera every rendered frame.
--- Shake.NextRenderName() prevents render-step binding name collisions.
+-- Shake.NextRenderName prevents render-step binding name collisions.
 local function playRejectionShake()
 	local camera = getCurrentCamera()
 	if not camera then
@@ -192,6 +202,8 @@ local function playRejectionShake()
 	)
 end
 
+-- Multiplying by AssemblyMass keeps the resulting velocity change
+-- consistent for characters with different physical mass.
 local function applyRejectionImpulse()
 	local rootPart = getCharacterRootPart()
 	if not rootPart then
@@ -215,8 +227,9 @@ local function applyRejectionImpulse()
 	rootPart:ApplyImpulse(impulse)
 end
 
--- Knit client signals do not automatically pass the receiving player.
--- The controller therefore operates on Players.LocalPlayer.
+-- Camera shake is skipped during egg hatching to avoid conflicting camera
+-- effects, but the physical rejection impulse is still applied.
+-- Knit client signals operate on Players.LocalPlayer automatically.
 local function onPlayerRejected()
 	if canApplyRejectionEffect() then
 		playRejectionShake()
@@ -225,6 +238,8 @@ local function onPlayerRejected()
 	applyRejectionImpulse()
 end
 
+-- Obstructions are registered from both live maps and replicated world
+-- assets so fading works regardless of where a map is currently stored.
 local function initializeMapObstructions()
 	local workspaceMaps = Workspace:FindFirstChild("Maps")
 	local replicatedWorlds = ReplicatedStorage:FindFirstChild("Worlds")
