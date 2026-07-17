@@ -29,8 +29,8 @@ local ChallengesService
 local RewardsService
 local PetAbilityService
 
--- Tracks players currently processing a normal spin.
--- This prevents duplicated remote requests from granting multiple rewards.
+-- Tracks players currently processing a normal spin to prevent duplicate
+-- remote requests from granting more than one reward.
 local activeSpins = {}
 
 local function getProfileContainer(player)
@@ -42,6 +42,8 @@ local function getProfileContainer(player)
 	return profile._Data
 end
 
+-- Profile loading is asynchronous, so initialization waits until the
+-- profile exists or the player leaves the server.
 local function waitForProfile(player)
 	while player.Parent == Players do
 		local profile = getProfileContainer(player)
@@ -55,6 +57,7 @@ local function waitForProfile(player)
 	return nil
 end
 
+-- Older profiles may not contain SpinWheelData, so it is created when needed.
 local function getSpinWheelContainer(profile)
 	local container = profile.SpinWheelData
 	if container then
@@ -67,7 +70,7 @@ local function getSpinWheelContainer(profile)
 	return container
 end
 
--- Ensures every configured wheel has a stored cooldown timestamp.
+-- Ensures every configured wheel has a saved cooldown timestamp.
 -- Existing values are preserved so rejoining does not reset cooldowns.
 local function initializeWheelEntries(profile)
 	local wheelContainer = getSpinWheelContainer(profile)
@@ -98,6 +101,8 @@ local function getWheelData(spinName)
 	return SpinWheelData[spinName]
 end
 
+-- Group-restricted wheels fail closed if Roblox cannot complete the
+-- membership request.
 local function isPlayerInRequiredGroup(player, wheelData)
 	local groupId = wheelData.GroupId
 	if not groupId then
@@ -122,6 +127,7 @@ local function isPlayerInRequiredGroup(player, wheelData)
 	return result
 end
 
+-- Invalid or missing cooldown values are repaired before use.
 local function getCooldownTimestamp(profile, spinName)
 	local wheelContainer = getSpinWheelContainer(profile)
 	local timestamp = wheelContainer[spinName]
@@ -138,6 +144,7 @@ local function isCooldownReady(profile, spinName)
 	return os.time() >= getCooldownTimestamp(profile, spinName)
 end
 
+-- All spin requirements are checked on the server before a reward is selected.
 local function validatePlayer(player, spinName)
 	local wheelData = getWheelData(spinName)
 	if not wheelData then
@@ -160,6 +167,8 @@ local function validatePlayer(player, spinName)
 	return true, nil, profile, wheelData
 end
 
+-- Ability calls are protected so a failure falls back to no luck bonus
+-- instead of stopping the spin.
 local function getLuckBoost(player)
 	local success, result = pcall(function()
 		return PetAbilityService:GetBoostByAbility(
@@ -184,6 +193,8 @@ local function getLuckBoost(player)
 	return math.max(result, 0)
 end
 
+-- Luck only increases the weight of rewards below the configured threshold,
+-- preventing common rewards from becoming even more likely.
 local function getAdjustedRewardWeight(reward, luckBoost)
 	local rewardChance = reward.RewardChance
 	if type(rewardChance) ~= "number" then
@@ -222,7 +233,7 @@ local function buildWeightedRewardList(player, rewards)
 end
 
 -- Selects a reward using a cumulative weighted roll.
--- The original reward key is returned so array and dictionary configs both work.
+-- The original key is returned so both array and dictionary configs work.
 local function getRandomReward(player, spinName)
 	local wheelData = getWheelData(spinName)
 	if not wheelData then
@@ -252,10 +263,12 @@ local function getRandomReward(player, spinName)
 		end
 	end
 
+	-- Floating-point edge cases fall back to the final valid reward.
 	local fallbackReward = weightedRewards[#weightedRewards]
 	return fallbackReward and fallbackReward.Index or nil
 end
 
+-- Cooldowns are stored as absolute Unix timestamps.
 local function setCooldown(profile, spinName, wheelData)
 	local wheelContainer = getSpinWheelContainer(profile)
 	local resetDuration = wheelData.ResetsEvery
@@ -272,6 +285,7 @@ local function resetCooldown(profile, spinName)
 	wheelContainer[spinName] = 0
 end
 
+-- Reward delivery is isolated so service errors do not break spin processing.
 local function rewardPlayer(player, reward)
 	if type(reward) ~= "table" then
 		return false
@@ -298,6 +312,7 @@ local function rewardPlayer(player, reward)
 	return true
 end
 
+-- Challenge progression should not invalidate a successfully granted reward.
 local function progressSpinChallenge(player, spinName, amount)
 	local success, errorMessage = pcall(function()
 		ChallengesService:ProgressChallenge(
@@ -323,6 +338,7 @@ local function fireSelectedReward(player, rewardIndex)
 	)
 end
 
+-- Selects the result, notifies the client and grants the server-side reward.
 local function processSpinReward(player, spinName, wheelData)
 	local rewardIndex = getRandomReward(player, spinName)
 	if rewardIndex == nil then
@@ -358,6 +374,8 @@ local function endSpin(player)
 	activeSpins[player] = nil
 end
 
+-- The cooldown is applied before reward processing to close the window for
+-- repeated requests. It is restored if the reward cannot be granted.
 local function spin(player, spinName)
 	if not beginSpin(player) then
 		return
@@ -392,6 +410,8 @@ local function spin(player, spinName)
 	end
 end
 
+-- Robux spins bypass normal validation and cooldowns because payment is
+-- expected to be verified by the server before this method is called.
 function SpinWheelService:RobuxSpin(player, spinName)
 	local wheelData = getWheelData(spinName)
 	if not wheelData then
@@ -413,12 +433,13 @@ function SpinWheelService:RobuxSpin(player, spinName)
 		return false, "InvalidReward"
 	end
 
-	-- Robux spins bypass the normal cooldown, but still keep the stored
-	-- wheel state reset so the free spin remains immediately available.
+	-- Keep the free-spin cooldown available after the paid spin.
 	resetCooldown(profile, spinName)
 
 	self.Client.SpinFromServer:Fire(player, spinName)
 
+	-- Gives the client time to begin the wheel animation before receiving
+	-- the selected result.
 	task.wait(ROBUX_SPIN_DELAY)
 
 	fireSelectedReward(player, rewardIndex)
@@ -447,6 +468,7 @@ function SpinWheelService:KnitStart()
 	Players.PlayerAdded:Connect(initializeData)
 	Players.PlayerRemoving:Connect(onPlayerRemoving)
 
+	-- Players may already exist if this service starts after they join.
 	for _, player in ipairs(Players:GetPlayers()) do
 		initializeData(player)
 	end
